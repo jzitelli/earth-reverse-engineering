@@ -7,7 +7,8 @@ _logger = logging.getLogger('convert_to_png')
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-d', '--directory', dest='directory', default=".",
+    parser.add_argument('-d', '--directory', dest='directory', 
+                        default="downloaded_files",
                         help='directory to convert')
     parser.add_argument('-r', '--recursive', action='store_false',
                         help='convert directory recursively')
