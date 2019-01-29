@@ -9,11 +9,11 @@ const PLANET = 'earth';
 const URL_PREFIX = `https://kh.google.com/rt/${PLANET}/`;
 const DL_DIR = './downloaded_files';
 const [DUMP_OBJ_DIR, DUMP_JSON_DIR, DUMP_RAW_DIR] = ['obj', 'json', 'raw'].map(x => path.join(DL_DIR, x));
-const {OCTANTS, MAX_LEVEL, DUMP_JSON, DUMP_RAW, PARALLEL_SEARCH} = require('./lib/parse-command-line')(__filename);
-const DUMP_OBJ = !(DUMP_JSON || DUMP_RAW);
+const { OCTANTS, MAX_LEVEL, DUMP_JSON, DUMP_RAW, PARALLEL_SEARCH } = require('./lib/parse-command-line')(__filename);
+const DUMP_OBJ = !(DUMP_JSON || DUMP_RAW);
 /****************************************************************/
 
-const {getPlanetoid, getBulk, getNode, bulk: { traverse, hasBulkMetadataAtIndex } } = require('./lib/utils')({
+const { getPlanetoid, getBulk, getNode, bulk: { getIndexByPath, hasBulkMetadataAtIndex, hasNodeAtIndex } } = require('./lib/utils')({
 	URL_PREFIX, DUMP_JSON_DIR, DUMP_RAW_DIR, DUMP_JSON, DUMP_RAW
 });
 
@@ -23,121 +23,117 @@ async function run() {
 	const planetoid = await getPlanetoid();
 	const rootEpoch = planetoid.bulkMetadataEpoch[0];
 
-	const objDir = path.join(DUMP_OBJ_DIR, `${OCTANTS.join('+')}-${MAX_LEVEL}-${rootEpoch}`);
+	let objCtx;
 	if (DUMP_OBJ) {
+		const objDir = path.join(DUMP_OBJ_DIR, `${OCTANTS.join('+')}-${MAX_LEVEL}-${rootEpoch}`);
 		fs.removeSync(objDir);
-		fs.ensureDirSync(objDir);		
+		fs.ensureDirSync(objDir);
+		objCtx = initCtxOBJ(objDir);
 	}
 
-	async function guessNextOctants(nodePath, forceAll = false) {		
-		const node = await getNodeFromNodePath(nodePath);
-		if (node === null) return null;
+	let octants = 0;
 
-		if (forceAll) return [0, 1, 2, 3, 4, 5, 6, 7]
-
-		// use mesh octant mask to guess next nodes
-		const dict = {}
-		node.meshes.forEach(mesh => {
-			for (let i = 0; i < mesh.vertices.length; i += 8) {
-				dict[mesh.vertices[i + 3]] = true
-			}
-		})
-		
-		const keys = Object.keys(dict).map(k => parseInt(k));
-		if (keys.filter(k => 0 <= k && k <= 7).length != keys.length) {
-			// invalid w
-			return null;
+	const search = initNodeSearch(rootEpoch, PARALLEL_SEARCH ? 16 : 1,
+		function nodeFound(path) {
+			console.log('found', path);
+			octants++;
+		},
+		function nodeDownloaded(path, node, octantsToExclude) {
+			console.log('downloaded', path);
+			DUMP_OBJ && writeNodeOBJ(objCtx, node, path, octantsToExclude);
 		}
-		return keys;
-	}
-
-	async function getNodeFromNodePath(nodePath) {
-		let bulk = null, index = -1;
-		for (let epoch = rootEpoch, i = 4; i < nodePath.length + 4; i += 4) {
-			const bulkPath = nodePath.substring(0, i - 4);
-			const subPath = nodePath.substring(0, i);
-
-			if (bulk) {
-				const idx = traverse(bulkPath, bulk.childIndices);
-				if (hasBulkMetadataAtIndex(bulk, idx)) return null;
-			}
-			
-			const nextBulk = await getBulk(bulkPath, epoch);
-			bulk = nextBulk;
-			index = traverse(subPath, bulk.childIndices);
-			epoch = bulk.bulkMetadataEpoch[index];
-		}
-		if (index < 0) return null;
-		const node = await getNode(nodePath, bulk, index);
-		
-		return node;
-	}
-
-	const keys = [];
-	async function search(k, level = 999) {
-		if (k.length > level) return;
-		let nxt;
-		try {
-			nxt = await guessNextOctants(k);
-			if (nxt === null) return;
-			
-			console.log("found: " + k)
-			keys.push(k);
-		} catch (ex) {			
-			console.error(ex)
-			return;
-		}
-
-		if (PARALLEL_SEARCH) {
-			const promises = [];
-			for (let i = 0; i < nxt.length; i++) {
-				const x = search(k + "" + nxt[i], level);
-				promises.push(x);
-			}
-			await Promise.all(promises);
-		} else {
-			for (let i = 0; i < nxt.length; i++) {
-				await search(k + "" + nxt[i], level);
-			}
-		}
-	}
+	);
 
 	for (const oct of OCTANTS) {
 		await search(oct, MAX_LEVEL);
 	}
 
-	console.log("octants: " + keys.length);
-
-	if (DUMP_OBJ) {
-		keys.sort();
-		keys.reverse();
-
-		const excluders = {};
-		const objCtx = initCtxOBJ(objDir);
-
-		for (let k = null, i = 0; i < keys.length; i++) {
-			k = keys[i];
-
-			const idx = parseInt(k.substring(k.length - 1, k.length));
-			const parentKey = k.substring(0, k.length - 1);
-
-			excluders[parentKey] = excluders[parentKey] || [];
-			excluders[parentKey].push(idx);
-
-			if ((excluders[k] || []).length === 8) {
-				continue;
-			}
-
-			const node = await getNodeFromNodePath(k);
-			writeNodeOBJ(objCtx, node, k, excluders[k] || []);
-		}
-	}
+	console.log('octants', octants)
 }
 /****************************************************************/
 
+/**************************** search ****************************/
+function initNodeSearch(rootEpoch, numParallelBranches = 1, nodeFound = null, nodeDownloaded = null) {
+	const sem = semaphore(numParallelBranches - 1);
 
+	return async function search(k, maxLevel = 999) {
+		if (k.length > maxLevel) return false;
 
-/**************************** helper ****************************/
+		let check;
+		try {
+			check = await checkNodeAtNodePath(rootEpoch, k);
+			if (check === null) return false;
+		} catch (ex) {
+			console.error(ex);
+			return false;
+		}
+
+		try {
+			nodeFound && nodeFound(k);
+		} catch (ex) {
+			console.error('Unhandled nodeFound callback error', ex);
+			return false;
+		}
+
+		const [promises, results] = [[], []];
+
+		for (const oct of [0, 1, 2, 3, 4, 5, 6, 7]) {
+			promises.push((async function fn() {
+				try {
+					results.push({ oct, res: await search(k + oct, maxLevel) });
+					if (results.length === 8) {
+						const octs = results.filter(({ res }) => res).map(({ oct }) => oct)
+						const node = await getNode(k, check.bulk, check.index);
+						try {
+							nodeDownloaded && nodeDownloaded(k, node, octs);
+						} catch (ex) {
+							console.error('Unhandled nodeDownload callback error');
+							throw ex;
+						}
+					}
+				} finally {
+					await new Promise((r, _) => setImmediate(r));
+					sem.signal();
+				}
+			})());
+
+			await sem.wait(true);
+		}
+
+		try {
+			await Promise.all(promises);
+		} catch (ex) {
+			console.error(ex);
+			return false;
+		}
+		return true;
+	};
+}
+
+async function checkNodeAtNodePath(rootEpoch, nodePath) {
+	let bulk = null, index = -1;
+	for (let epoch = rootEpoch, i = 4; i < nodePath.length + 4; i += 4) {
+		const bulkPath = nodePath.substring(0, i - 4);
+		const subPath = nodePath.substring(0, i);
+
+		if (bulk) {
+			const idx = getIndexByPath(bulk, bulkPath);
+			if (hasBulkMetadataAtIndex(bulk, idx)) return null;
+		}
+
+		const nextBulk = await getBulk(bulkPath, epoch);
+
+		bulk = nextBulk;
+		index = getIndexByPath(bulk, subPath);
+		epoch = bulk.bulkMetadataEpoch[index];
+	}
+	if (index < 0) return null;
+	if (!hasNodeAtIndex(bulk, index)) return null;
+	return { bulk, index };
+}
+/****************************************************************/
+
+/**************************** export ****************************/
 function initCtxOBJ(dir) {
 	fs.writeFileSync(path.join(dir, 'model.obj'), `mtllib model.mtl\n`);
 	return { objDir: dir, c_v: 0, c_n: 0, c_u: 0 };
@@ -145,15 +141,14 @@ function initCtxOBJ(dir) {
 
 function writeNodeOBJ(ctx, node, nodeName, exclude) {
 	for (const [meshIndex, mesh] of Object.entries(node.meshes)) {
-		const meshName = `${nodeName}_${meshIndex}`;		
+		const meshName = `${nodeName}_${meshIndex}`;
 		const tex = mesh.texture;
 		const texName = `tex_${nodeName}_${meshIndex}`;
 
 		const obj = writeMeshOBJ(ctx, meshName, texName, node, mesh, exclude);
-		fs.appendFileSync(path.join(ctx.objDir, 'model.obj'), obj);		
+		fs.appendFileSync(path.join(ctx.objDir, 'model.obj'), obj);
 
-
-		const {buffer: buf, extension: ext} = decodeTexture(tex);
+		const { buffer: buf, extension: ext } = decodeTexture(tex);
 		fs.appendFileSync(path.join(ctx.objDir, 'model.mtl'), `
 			newmtl ${texName}
 			Ka 1.000000 1.000000 1.000000
@@ -277,9 +272,9 @@ function writeMeshOBJ(ctx, meshName, texName, payload, mesh, exclude) {
 	const triangle_groups = {};
 	for (let i = 0; i < indices.length - 2; i += 1) {
 		if (i === mesh.layerBounds[3]) break;
-		const a = indices[i + 0],
-		      b = indices[i + 1],
-		      c = indices[i + 2];
+		const a = indices[i + 0];
+		const b = indices[i + 1];
+		const c = indices[i + 2];
 		if (a == b || a == c || b == c) {
 			continue;
 		}
@@ -317,8 +312,40 @@ function writeMeshOBJ(ctx, meshName, texName, payload, mesh, exclude) {
 
 	return str;
 }
-
 /****************************************************************/
+
+/**************************** helper ****************************/
+function semaphore(num) {
+	let concurrent = num;
+	const waiting = [];
+	return {
+		wait(highestPriority = false) {
+			return new Promise((resolve, reject) => {
+				if (concurrent <= 0) {
+					if (highestPriority) {
+						waiting.splice(0, 0, { resolve, reject });
+					} else {
+						waiting.push(({ resolve, reject }));
+					}
+				} else {
+					concurrent--;
+					resolve();
+				}
+			})
+		},
+		signal() {
+			concurrent++;
+			if (concurrent > 0) {
+				if (waiting.length > 0) {
+					concurrent--;
+					waiting.splice(0, 1)[0].resolve();
+				}
+			}
+		}
+	};
+}
+/****************************************************************/
+
 (async function program() {
 	await run();
 })().then(() => {
